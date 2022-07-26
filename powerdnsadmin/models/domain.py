@@ -737,6 +737,10 @@ class Domain(db.Model):
                             jdata
                     }
 
+                domain.dnssec = 1
+                db.session.commit()
+                current_app.logger.info('Update domain dnssec enabled')
+
                 return {'status': 'ok'}
 
             except Exception as e:
@@ -800,6 +804,10 @@ class Domain(db.Model):
                             'API-RECTIFY could not be disabled for this domain',
                         'jdata': jdata
                     }
+
+                domain.dnssec = 0
+                db.session.commit()
+                current_app.logger.info('Update domain dnssec disabled')
 
                 return {'status': 'ok'}
 
@@ -893,7 +901,7 @@ class Domain(db.Model):
                 AccountUser.user_id == user_id
             )).filter(Domain.id == self.id).first()
 
-    # Return None if this domain does not exist as record, 
+    # Return None if this domain does not exist as record,
     # Return the parent domain that hold the record if exist
     def is_overriding(self, domain_name):
         upper_domain_name = '.'.join(domain_name.split('.')[1:])
