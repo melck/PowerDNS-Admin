@@ -23,9 +23,11 @@ nosetests.xml
 # tmp files
 .~*
 
+.flaskenv
 flask
 config.py
 configs/production.py
+log/*
 logfile.log
 log.txt
 pdns.db
