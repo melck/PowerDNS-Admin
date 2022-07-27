@@ -12,6 +12,7 @@ import qrcode as qrc
 import qrcode.image.svg as qrc_svg
 from io import BytesIO
 
+from ..lib import ldap_utils
 from .base import db
 from .role import Role
 from .setting import Setting
@@ -120,57 +121,6 @@ class User(db.Model):
         user_info = User.query.filter(User.username == self.username).first()
         return user_info
 
-    def ldap_init_conn(self):
-        ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
-        conn = ldap.initialize(Setting().get('ldap_uri'))
-        conn.set_option(ldap.OPT_REFERRALS, ldap.OPT_OFF)
-        conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
-        conn.set_option(ldap.OPT_X_TLS, ldap.OPT_X_TLS_DEMAND)
-        conn.set_option(ldap.OPT_X_TLS_DEMAND, True)
-        conn.set_option(ldap.OPT_DEBUG_LEVEL, 255)
-        conn.protocol_version = ldap.VERSION3
-        return conn
-
-    def ldap_search(self, searchFilter, baseDN, retrieveAttributes=None):
-        searchScope = ldap.SCOPE_SUBTREE
-
-        try:
-            conn = self.ldap_init_conn()
-            if Setting().get('ldap_type') == 'ad':
-                conn.simple_bind_s(
-                    "{0}@{1}".format(self.username,
-                                     Setting().get('ldap_domain')),
-                    self.password)
-            else:
-                conn.simple_bind_s(Setting().get('ldap_admin_username'),
-                                   Setting().get('ldap_admin_password'))
-            ldap_result_id = conn.search(baseDN, searchScope, searchFilter,
-                                         retrieveAttributes)
-            result_set = []
-
-            while 1:
-                result_type, result_data = conn.result(ldap_result_id, 0)
-                if (result_data == []):
-                    break
-                else:
-                    if result_type == ldap.RES_SEARCH_ENTRY:
-                        result_set.append(result_data)
-            return result_set
-
-        except ldap.LDAPError as e:
-            current_app.logger.error(e)
-            current_app.logger.debug('baseDN: {0}'.format(baseDN))
-            current_app.logger.debug(traceback.format_exc())
-
-    def ldap_auth(self, ldap_username, password):
-        try:
-            conn = self.ldap_init_conn()
-            conn.simple_bind_s(ldap_username, password)
-            return True
-        except ldap.LDAPError as e:
-            current_app.logger.error(e)
-            return False
-
     def is_validate(self, method, src_ip='', trust_user=False):
         """
         Validate user credential
@@ -199,188 +149,36 @@ class User(db.Model):
             return False
 
         if method == 'LDAP':
-            LDAP_TYPE = Setting().get('ldap_type')
-            LDAP_BASE_DN = Setting().get('ldap_base_dn')
-            LDAP_FILTER_BASIC = Setting().get('ldap_filter_basic')
-            LDAP_FILTER_USERNAME = Setting().get('ldap_filter_username')
-            LDAP_FILTER_GROUP = Setting().get('ldap_filter_group')
-            LDAP_FILTER_GROUPNAME = Setting().get('ldap_filter_groupname')
-            LDAP_ADMIN_GROUP = Setting().get('ldap_admin_group')
-            LDAP_OPERATOR_GROUP = Setting().get('ldap_operator_group')
-            LDAP_USER_GROUP = Setting().get('ldap_user_group')
-            LDAP_GROUP_SECURITY_ENABLED = Setting().get('ldap_sg_enabled')
-
-            # validate AD user password
-            if Setting().get('ldap_type') == 'ad' and not trust_user:
-                ldap_username = "{0}@{1}".format(self.username,
-                                                 Setting().get('ldap_domain'))
-                if not self.ldap_auth(ldap_username, self.password):
-                    current_app.logger.error(
-                        'User "{0}" input a wrong LDAP password. Authentication request from {1}'
-                        .format(self.username, src_ip))
-                    return False
-
-            searchFilter = "(&({0}={1}){2})".format(LDAP_FILTER_USERNAME,
-                                                    self.username,
-                                                    LDAP_FILTER_BASIC)
-            current_app.logger.debug('Ldap searchFilter {0}'.format(searchFilter))
-
-            ldap_result = self.ldap_search(searchFilter, LDAP_BASE_DN)
-            current_app.logger.debug('Ldap search result: {0}'.format(ldap_result))
-
-            if not ldap_result:
-                current_app.logger.warning(
-                    'LDAP User "{0}" does not exist. Authentication request from {1}'
-                    .format(self.username, src_ip))
-                return False
-            else:
-                try:
-                    ldap_username = ldap.filter.escape_filter_chars(
-                        ldap_result[0][0][0])
-
-                    if Setting().get('ldap_type') != 'ad' and not trust_user:
-                        # validate ldap user password
-                        if not self.ldap_auth(ldap_username, self.password):
-                            current_app.logger.error(
-                                'User "{0}" input a wrong LDAP password. Authentication request from {1}'
-                                .format(self.username, src_ip))
-                            return False
-
-                    # check if LDAP_GROUP_SECURITY_ENABLED is True
-                    # user can be assigned to ADMIN or USER role.
-                    if LDAP_GROUP_SECURITY_ENABLED:
-                        try:
-                            if LDAP_TYPE == 'ldap':
-                                groupSearchFilter = "(&({0}={1}){2})".format(LDAP_FILTER_GROUPNAME, ldap_username, LDAP_FILTER_GROUP)
-                                current_app.logger.debug('Ldap groupSearchFilter {0}'.format(groupSearchFilter))
-                                if (self.ldap_search(groupSearchFilter,
-                                                     LDAP_ADMIN_GROUP)):
-                                    role_name = 'Administrator'
-                                    current_app.logger.info(
-                                        'User {0} is part of the "{1}" group that allows admin access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_ADMIN_GROUP))
-                                elif (self.ldap_search(groupSearchFilter,
-                                                       LDAP_OPERATOR_GROUP)):
-                                    role_name = 'Operator'
-                                    current_app.logger.info(
-                                        'User {0} is part of the "{1}" group that allows operator access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_OPERATOR_GROUP))
-                                elif (self.ldap_search(groupSearchFilter,
-                                                       LDAP_USER_GROUP)):
-                                    current_app.logger.info(
-                                        'User {0} is part of the "{1}" group that allows user access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_USER_GROUP))
-                                else:
-                                    current_app.logger.error(
-                                        'User {0} is not part of the "{1}", "{2}" or "{3}" groups that allow access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_ADMIN_GROUP,
-                                                LDAP_OPERATOR_GROUP,
-                                                LDAP_USER_GROUP))
-                                    return False
-                            elif LDAP_TYPE == 'ad':
-                                ldap_admin_group_filter, ldap_operator_group, ldap_user_group = "", "", ""
-                                if LDAP_ADMIN_GROUP:
-                                    ldap_admin_group_filter = "(memberOf:1.2.840.113556.1.4.1941:={0})".format(LDAP_ADMIN_GROUP)
-                                if LDAP_OPERATOR_GROUP:
-                                    ldap_operator_group = "(memberOf:1.2.840.113556.1.4.1941:={0})".format(LDAP_OPERATOR_GROUP)
-                                if LDAP_USER_GROUP:
-                                    ldap_user_group = "(memberOf:1.2.840.113556.1.4.1941:={0})".format(LDAP_USER_GROUP)
-                                searchFilter = "(&({0}={1})(|{2}{3}{4}))".format(LDAP_FILTER_USERNAME, self.username,
-                                                                                 ldap_admin_group_filter,
-                                                                                 ldap_operator_group, ldap_user_group)
-                                ldap_result = self.ldap_search(searchFilter, LDAP_BASE_DN)
-                                user_ad_member_of = ldap_result[0][0][1].get(
-                                    'memberOf')
-
-                                if not user_ad_member_of:
-                                    current_app.logger.error(
-                                        'User {0} does not belong to any group while LDAP_GROUP_SECURITY_ENABLED is ON'
-                                        .format(self.username))
-                                    return False
-
-                                user_ad_member_of = [g.decode("utf-8") for g in user_ad_member_of]
-
-                                if (LDAP_ADMIN_GROUP in user_ad_member_of):
-                                    role_name = 'Administrator'
-                                    current_app.logger.info(
-                                        'User {0} is part of the "{1}" group that allows admin access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_ADMIN_GROUP))
-                                elif (LDAP_OPERATOR_GROUP in user_ad_member_of):
-                                    role_name = 'Operator'
-                                    current_app.logger.info(
-                                        'User {0} is part of the "{1}" group that allows operator access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_OPERATOR_GROUP))
-                                elif (LDAP_USER_GROUP in user_ad_member_of):
-                                    current_app.logger.info(
-                                        'User {0} is part of the "{1}" group that allows user access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_USER_GROUP))
-                                else:
-                                    current_app.logger.error(
-                                        'User {0} is not part of the "{1}", "{2}" or "{3}" groups that allow access to PowerDNS-Admin'
-                                        .format(self.username,
-                                                LDAP_ADMIN_GROUP,
-                                                LDAP_OPERATOR_GROUP,
-                                                LDAP_USER_GROUP))
-                                    return False
-                            else:
-                                current_app.logger.error('Invalid LDAP type')
-                                return False
-                        except Exception as e:
-                            current_app.logger.error(
-                                'LDAP group lookup for user "{0}" has failed. Authentication request from {1}'
-                                .format(self.username, src_ip))
-                            current_app.logger.debug(traceback.format_exc())
-                            return False
-
-                except Exception as e:
-                    current_app.logger.error('Wrong LDAP configuration. {0}'.format(e))
-                    current_app.logger.debug(traceback.format_exc())
-                    return False
+            ldap_user = ldap_utils.get_user(
+                self.username,
+                self.password,
+                src_ip,
+                trust_user
+            )
 
             # create user if not exist in the db
             if not User.query.filter(User.username == self.username).first():
-                self.firstname = self.username
-                self.lastname = ''
-                try:
-                    # try to get user's firstname, lastname and email address from LDAP attributes
-                    if LDAP_TYPE == 'ldap':
-                        self.firstname = ldap_result[0][0][1]['givenName'][
-                            0].decode("utf-8")
-                        self.lastname = ldap_result[0][0][1]['sn'][0].decode(
-                            "utf-8")
-                        self.email = ldap_result[0][0][1]['mail'][0].decode(
-                            "utf-8")
-                    elif LDAP_TYPE == 'ad':
-                        self.firstname = ldap_result[0][0][1]['name'][
-                            0].decode("utf-8")
-                        self.email = ldap_result[0][0][1]['userPrincipalName'][
-                            0].decode("utf-8")
-                except Exception as e:
-                    current_app.logger.warning(
-                        "Reading ldap data threw an exception {0}".format(e))
-                    current_app.logger.debug(traceback.format_exc())
+                self.lastname = ldap_user.get('firstname')
+                self.firstname = ldap_user.get('firstname')
+                self.email = ldap_user.get('email')
+
+                if not self.firstname and not self.lastname:
+                    self.firstname = self.username
+
+                user_role_name = ldap_user.get('role')
 
                 # first register user will be in Administrator role
                 if User.query.count() == 0:
-                    self.role_id = Role.query.filter_by(
-                        name='Administrator').first().id
-                else:
-                    self.role_id = Role.query.filter_by(
-                        name=role_name).first().id
+                    user_role_name = 'Administrator'
+
+                role = Role.query.filter_by(name=user_role_name).first()
+                self.role_id = role.id()
 
                 self.create_user()
-                current_app.logger.info('Created user "{0}" in the DB'.format(
-                    self.username))
+                current_app.logger.info(f"Created user '{self.username}'")
 
             # user already exists in database, set their role based on group membership (if enabled)
-            if LDAP_GROUP_SECURITY_ENABLED:
+            if ldap_utils.LDAP_GROUP_SECURITY_ENABLED:
                 self.set_role(role_name)
 
             return True
@@ -586,13 +384,21 @@ class User(db.Model):
 
     def set_role(self, role_name):
         role = Role.query.filter(Role.name == role_name).first()
-        if role:
-            user = User.query.filter(User.username == self.username).first()
+
+        if not role:
+            return {
+                'status': False,
+                'msg': f"Role '{role_name}' does not exist",
+            }
+
+        user = User.query.filter(User.username == self.username).first()
+
+        if user.role_id != role.id:
             user.role_id = role.id
             db.session.commit()
-            return {'status': True, 'msg': 'Set user role successfully'}
-        else:
-            return {'status': False, 'msg': 'Role does not exist'}
+            return {'status': True, 'msg': 'User role updated'}
+
+        return {'status': True, 'msg': 'User role identical'}
 
     @orm.reconstructor
     def set_account(self):
