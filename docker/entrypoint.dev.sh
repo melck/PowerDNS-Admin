@@ -14,7 +14,7 @@ case "$action" in
 dev)
   build_assets
   flask db upgrade
-  exec flask run --debugger --host 0.0.0.0
+  exec flask run --host 0.0.0.0
   ;;
 *)
   exec "$action" "$@"
