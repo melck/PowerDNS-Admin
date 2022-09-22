@@ -20,4 +20,4 @@ class Role(db.Model):
         self.description = description
 
     def __repr__(self):
-        return '<Role {0}r>'.format(self.name)
+        return f"<Role {self.name!r}>"

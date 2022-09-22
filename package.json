@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@selectize/selectize": "^0.13.6",
     "admin-lte": "2.4.9",
     "bootstrap": "^3.4.1",
     "bootstrap-datepicker": "^1.8.0",

@@ -2,7 +2,6 @@ import json
 import datetime
 import traceback
 import re
-from base64 import b64encode
 from ast import literal_eval
 from flask import Blueprint, render_template, render_template_string, make_response, url_for, current_app, request, redirect, jsonify, abort, flash, session
 from flask_login import login_required, current_user
@@ -23,7 +22,7 @@ from ..models.domain_template_record import DomainTemplateRecord
 from ..models.api_key import ApiKey
 from ..models.base import db
 
-from ..lib.errors import ApiKeyCreateFail
+from ..lib.errors import ApiKeyCreateFail, ApiKeyNotUsable
 from ..lib.schema import ApiPlainKeySchema
 
 apikey_plain_schema = ApiPlainKeySchema(many=True)
@@ -296,90 +295,194 @@ def edit_user(user_username=None):
                                create=create,
                                error=result['msg'])
 
-@admin_bp.route('/key/edit/<key_id>', methods=['GET', 'POST'])
+@admin_bp.route('/key/edit/<int:key_id>', methods=['GET', 'POST'])
 @admin_bp.route('/key/edit', methods=['GET', 'POST'])
 @login_required
 @operator_role_required
 def edit_key(key_id=None):
-    domains = Domain.query.all()
-    accounts = Account.query.all()
-    roles = Role.query.all()
     apikey = None
     create = True
-    plain_key = None
+    roles = Role.query.all()
 
     if key_id:
-        apikey = ApiKey.query.filter(ApiKey.id == key_id).first()
-        create = False
+        apikey = (
+            ApiKey
+            .query
+            .options(
+                db.joinedload(ApiKey.domains),
+                db.joinedload(ApiKey.accounts),
+            )
+            .filter(ApiKey.id == key_id)
+            .scalar()
+        )
 
         if not apikey:
             return render_template('errors/404.html'), 404
 
+        create = False
+
     if request.method == 'GET':
-        return render_template('admin_edit_key.html',
-                               key=apikey,
-                               domains=domains,
-                               accounts=accounts,
-                               roles=roles,
-                               create=create)
+
+        return render_template(
+            'admin_edit_key.html',
+            create=create,
+            key=apikey,
+            roles=roles,
+        )
 
     if request.method == 'POST':
+        accounts = []
+        domains = []
+        form_valid = True
+        form_errors = {
+            "role": [],
+            "description": [],
+            "accounts": [],
+            "domains": [],
+        }
+
         fdata = request.form
-        description = fdata['description']
-        role = fdata.getlist('key_role')[0]
-        domain_list = fdata.getlist('key_multi_domain')
-        account_list = fdata.getlist('key_multi_account')
+        role = fdata.get('key_role')
+        description = fdata.get('description')
+
+        if not description:
+            form_valid = False
+            form_errors['description'].append("Description cannot be empty.")
+
+        if role:
+            role = Role.query.filter(Role.name == role).scalar()
+
+        if not role:
+            form_valid = False
+            form_errors['role'].append("Role does'nt exist.")
+
+        if role and role.name == "User":
+            domains = (
+                Domain
+                .query
+                .filter(Domain.id.in_(fdata.getlist('key_domains')))
+                .all()
+            )
+            accounts = (
+                Account
+                .query
+                .filter(Account.id.in_(fdata.getlist('key_accounts')))
+                .all()
+            )
+
+            if not accounts:
+                form_valid = False
+                form_errors['accounts'].append(
+                    'At least one account must be selected.'
+                )
+
+            if not domains:
+                form_valid = False
+                form_errors['domains'].append(
+                    'At least one domain must be selected.'
+                )
+
+        if not form_valid:
+            roles = Role.query.all()
+            return render_template(
+                'admin_edit_key.html',
+                key=ApiKey(
+                    role=role,
+                    description=description,
+                    accounts=accounts,
+                    domains=domains,
+                ),
+                errors=form_errors,
+                roles=roles,
+                create=create,
+            )
+
 
         # Create new apikey
         if create:
-            if role == "User":
-                domain_obj_list = Domain.query.filter(Domain.name.in_(domain_list)).all()
-                account_obj_list = Account.query.filter(Account.name.in_(account_list)).all()
-            else:
-                account_obj_list, domain_obj_list = [], []
+            apikey = ApiKey(
+                role=role,
+                description=description,
+                domains=domains,
+                accounts=accounts,
+            )
 
-            apikey = ApiKey(desc=description,
-                            role_name=role,
-                            domains=domain_obj_list,
-                            accounts=account_obj_list)
             try:
-                apikey.create()
+                apikey.create(current_user.username)
+                create = False
             except Exception as e:
                 current_app.logger.error('Error: {0}'.format(e))
-                raise ApiKeyCreateFail(message='Api key create failed')
-
-            plain_key = apikey_plain_schema.dump([apikey])[0]["plain_key"]
-            plain_key = b64encode(plain_key.encode('utf-8')).decode('utf-8')
-            history_message =  "Created API key {0}".format(apikey.id)
+                raise ApiKeyCreateFail(message='Api key create failed') from e
 
         # Update existing apikey
         else:
             try:
-                if role != "User":
-                    domain_list, account_list = [], []
-                apikey.update(role,description,domain_list, account_list)
-                history_message =  "Updated API key {0}".format(apikey.id)
+                apikey.update(
+                    description,
+                    current_user.username,
+                    role,
+                    domains,
+                    accounts
+                )
             except Exception as e:
                 current_app.logger.error('Error: {0}'.format(e))
 
-        history = History(msg=history_message,
-                          detail = json.dumps({
-                                'key': apikey.id,
-                                'role': apikey.role.name,
-                                'description': apikey.description,
-                                'domains': [domain.name for domain in apikey.domains],
-                                'accounts': [a.name for a in apikey.accounts]
-                            }),
-                          created_by=current_user.username)
-        history.add()
+        roles = Role.query.all()
+        return render_template(
+            'admin_edit_key.html',
+            key=apikey,
+            roles=roles,
+            create=create,
+        )
 
-        return render_template('admin_edit_key.html',
-                               key=apikey,
-                               domains=domains,
-                               accounts=accounts,
-                               roles=roles,
-                               create=create,
-                               plain_key=plain_key)
+
+@admin_bp.route('/search/domain')
+@admin_bp.route('/search/domain/<query>')
+@login_required
+@operator_role_required
+def search_domains(query=""):
+    data = (
+        db
+        .session
+        .query(Domain.id, Domain.name)
+        .filter(Domain.name.contains(query, autoescape=True))
+        [:50]
+    )
+
+    data = [
+        {"id": id, "name": name}
+        for id, name in data
+    ]
+
+    response = make_response(jsonify(data))
+    response.headers["Content-Type"] = "application/json"
+
+    return response
+
+
+@admin_bp.route('/search/account')
+@admin_bp.route('/search/account/<query>')
+@login_required
+@operator_role_required
+def search_accounts(query=""):
+    data = (
+        db
+        .session
+        .query(Account.id, Account.name)
+        .filter(Account.name.contains(query, autoescape=True))
+        [:50]
+    )
+
+    data = [
+        {"id": id, "name": name}
+        for id, name in data
+    ]
+
+    response = make_response(jsonify(data))
+    response.headers["Content-Type"] = "application/json"
+
+    return response
+
 
 @admin_bp.route('/manage-keys', methods=['GET', 'POST'])
 @login_required
